@@ -537,22 +537,16 @@ body {
   flex: 0 0 auto;
 }
 
-.jarvis-avatar svg {
-  width: 18px;
-  height: 18px;
-  display: block;
-}
-
 .jarvis-avatar-assistant {
-  border-color: rgba(139, 243, 255, 0.18);
-  background: rgba(139, 243, 255, 0.06);
-  color: rgba(139, 243, 255, 0.92);
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.05);
+  color: rgba(255, 255, 255, 0.86);
 }
 
 .jarvis-avatar-user {
   border-color: rgba(255, 255, 255, 0.10);
   background: rgba(255, 255, 255, 0.06);
-  color: rgba(255, 255, 255, 0.90);
+  color: rgba(255, 255, 255, 0.86);
 }
 
 .jarvis-prose {

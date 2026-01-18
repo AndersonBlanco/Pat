@@ -1398,7 +1398,14 @@ export default function ChatApp() {
             {hasUserMessage ? (
               <div className="mx-auto w-full max-w-[860px] space-y-8">
                 {messages.map((m) => (
-                  <div key={m.id} className="group flex gap-4">
+                  <div
+                    key={m.id}
+                    className={
+                      m.role === "user"
+                        ? "group flex flex-row-reverse items-start justify-start gap-3"
+                        : "group flex gap-4"
+                    }
+                  >
                     <div
                       className={
                         m.role === "assistant"
@@ -1407,36 +1414,30 @@ export default function ChatApp() {
                       }
                       aria-hidden="true"
                     >
-                      {m.role === "assistant" ? (
-                        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                          <path
-                            d="M12 2l1.2 4.6L18 5l-2.6 3.9L20 12l-4.6 1.1L18 19l-4.8-1.6L12 22l-1.2-4.6L6 19l2.6-5.9L4 12l4.6-3.1L6 5l4.8 1.6L12 2Z"
-                            stroke="currentColor"
-                            strokeWidth="1.6"
-                            strokeLinejoin="round"
-                          />
-                          <circle cx="12" cy="12" r="2.1" fill="currentColor" opacity="0.28" />
-                        </svg>
-                      ) : (
-                        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-                          <path
-                            d="M12 12a4.25 4.25 0 1 0-4.25-4.25A4.25 4.25 0 0 0 12 12Z"
-                            stroke="currentColor"
-                            strokeWidth="1.6"
-                          />
-                          <path
-                            d="M4.5 21c1.9-4 5.1-6 7.5-6s5.6 2 7.5 6"
-                            stroke="currentColor"
-                            strokeWidth="1.6"
-                            strokeLinecap="round"
-                          />
-                        </svg>
-                      )}
+                      {m.role === "assistant" ? "G" : "Y"}
                     </div>
 
-                    <div className="min-w-0 flex-1">
-                      <div className="mb-2 flex items-center justify-between gap-2">
-                        <div className="text-[12px] font-medium text-[color:var(--jarvis-muted)]">
+                    <div
+                      className={
+                        m.role === "user"
+                          ? "flex min-w-0 max-w-[720px] flex-col items-end"
+                          : "min-w-0 flex-1"
+                      }
+                    >
+                      <div
+                        className={
+                          m.role === "user"
+                            ? "mb-2 flex w-full items-center justify-end gap-2"
+                            : "mb-2 flex items-center justify-between gap-2"
+                        }
+                      >
+                        <div
+                          className={
+                            m.role === "user"
+                              ? "text-right text-[12px] font-medium text-[color:var(--jarvis-muted)]"
+                              : "text-[12px] font-medium text-[color:var(--jarvis-muted)]"
+                          }
+                        >
                           {m.role === "assistant" ? "Grok" : "You"}
                         </div>
                         <button
@@ -1454,7 +1455,7 @@ export default function ChatApp() {
                         className={
                           m.role === "assistant"
                             ? "jarvis-bubble jarvis-bubble-assistant"
-                            : "jarvis-bubble jarvis-bubble-user"
+                            : "jarvis-bubble jarvis-bubble-user w-fit max-w-[720px]"
                         }
                       >
                         <div className="jarvis-prose whitespace-pre-wrap text-[15px] leading-7 text-[color:var(--jarvis-text)]">
