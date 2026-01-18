@@ -17,6 +17,8 @@ type Settings = {
   systemPrompt: string;
   webScrapeEnabled: boolean;
   webScrapeAuto: boolean;
+  githubEnabled: boolean;
+  githubRepo: { owner: string; repo: string; ref: string } | null;
 };
 
 type Project = {
@@ -53,6 +55,16 @@ type SpeechRecognitionLike = {
   abort: () => void;
 };
 
+type VoiceWsSession = {
+  ws: WebSocket;
+  micStream: MediaStream;
+  audioContext: AudioContext;
+  processor: ScriptProcessorNode;
+  source: MediaStreamAudioSourceNode;
+  silentGain: GainNode;
+  nextPlayTime: number;
+};
+
 const SETTINGS_KEY = "pat.settings.v1";
 const MESSAGES_KEY = "pat.messages.v1";
 const PROJECTS_KEY = "pat.projects.v1";
@@ -68,6 +80,8 @@ const DEFAULT_SETTINGS: Settings = {
     "You are Grok, running in a sleek JARVIS-style console. Be direct, helpful, and technical. Use short, actionable answers. Ask clarifying questions when needed.",
   webScrapeEnabled: false,
   webScrapeAuto: true,
+  githubEnabled: false,
+  githubRepo: null,
 };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -194,12 +208,17 @@ export default function ChatApp() {
   const voiceTranscriptRef = useRef("");
   const voiceStopShouldSendRef = useRef(false);
   const sendRef = useRef<(override?: unknown) => Promise<void> | void>(() => {});
+  const voiceWsRef = useRef<VoiceWsSession | null>(null);
+  const voiceWsClosingRef = useRef(false);
+  const voiceSessionPhaseRef = useRef<"idle" | "connecting" | "recording" | "responding" | "error">("idle");
 
   const [model, setModel] = useState(DEFAULT_SETTINGS.model);
   const [temperature, setTemperature] = useState(DEFAULT_SETTINGS.temperature);
   const [systemPrompt, setSystemPrompt] = useState(DEFAULT_SETTINGS.systemPrompt);
   const [webScrapeEnabled, setWebScrapeEnabled] = useState(DEFAULT_SETTINGS.webScrapeEnabled);
   const [webScrapeAuto, setWebScrapeAuto] = useState(DEFAULT_SETTINGS.webScrapeAuto);
+  const [githubEnabled, setGithubEnabled] = useState(DEFAULT_SETTINGS.githubEnabled);
+  const [githubRepo, setGithubRepo] = useState<Settings["githubRepo"]>(DEFAULT_SETTINGS.githubRepo);
 
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
@@ -216,6 +235,11 @@ export default function ChatApp() {
   const [voiceSupported, setVoiceSupported] = useState(true);
   const [isListening, setIsListening] = useState(false);
   const [voiceError, setVoiceError] = useState<string | null>(null);
+  const [isVoiceSessionActive, setIsVoiceSessionActive] = useState(false);
+  const [voiceSessionStatus, setVoiceSessionStatus] = useState<
+    "idle" | "connecting" | "recording" | "responding" | "error"
+  >("idle");
+  const [voiceSessionError, setVoiceSessionError] = useState<string | null>(null);
 
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [modelOpen, setModelOpen] = useState(true);
@@ -223,6 +247,7 @@ export default function ChatApp() {
   const [tasksOpen, setTasksOpen] = useState(true);
   const [pinsOpen, setPinsOpen] = useState(true);
   const [sidebarWidth, setSidebarWidth] = useState(320);
+  const [hydrated, setHydrated] = useState(false);
 
   const [projects, setProjects] = useState<Project[]>([
     { id: "inbox", name: "Inbox" },
@@ -267,6 +292,11 @@ export default function ChatApp() {
       projects: projectsPayload,
       tasks,
       webPins,
+      github: {
+        toolsEnabled: githubEnabled,
+        selectedRepo: githubRepo ? `${githubRepo.owner}/${githubRepo.repo}` : null,
+        ref: githubRepo?.ref || "",
+      },
       meta: {
         truncated: {
           projects: projects.length > projectsPayload.length,
@@ -277,143 +307,191 @@ export default function ChatApp() {
     };
 
     return `Workspace context (Projects/Tasks/Web Pins): ${JSON.stringify(payload)}`;
-  }, [activeProjectId, pinsByProject, projects, tasksByProject]);
+  }, [activeProjectId, githubEnabled, githubRepo, pinsByProject, projects, tasksByProject]);
 
   useEffect(() => {
-    try {
-      const rawSettings = localStorage.getItem(SETTINGS_KEY);
-      if (rawSettings) {
+    function syncSettingsFromStorage() {
+      try {
+        const rawSettings = safeLocalStorageGet(SETTINGS_KEY);
+        if (!rawSettings) return;
         const parsed = JSON.parse(rawSettings) as unknown;
-        if (isRecord(parsed)) {
-          if (typeof parsed.model === "string") setModel(parsed.model);
-          if (typeof parsed.temperature === "number") {
-            setTemperature(clampNumber(parsed.temperature, 0, 2));
-          }
-          if (typeof parsed.systemPrompt === "string") {
-            setSystemPrompt(parsed.systemPrompt);
-          }
-          if (typeof parsed.webScrapeEnabled === "boolean") {
-            setWebScrapeEnabled(parsed.webScrapeEnabled);
-          }
-          if (typeof parsed.webScrapeAuto === "boolean") {
-            setWebScrapeAuto(parsed.webScrapeAuto);
-          }
-        }
-      }
+        if (!isRecord(parsed)) return;
 
-      const rawMessages = localStorage.getItem(MESSAGES_KEY);
-      if (rawMessages) {
-        const parsed = JSON.parse(rawMessages) as unknown;
-        if (Array.isArray(parsed)) {
-          const loaded: ChatMessage[] = [];
-          for (const item of parsed) {
-            if (!isRecord(item)) continue;
-            const role = item.role;
-            const content = item.content;
-            if ((role !== "user" && role !== "assistant") || typeof content !== "string") {
-              continue;
+        if (typeof parsed.model === "string") setModel(parsed.model);
+        if (typeof parsed.temperature === "number") {
+          setTemperature(clampNumber(parsed.temperature, 0, 2));
+        }
+        if (typeof parsed.systemPrompt === "string") setSystemPrompt(parsed.systemPrompt);
+        if (typeof parsed.webScrapeEnabled === "boolean") setWebScrapeEnabled(parsed.webScrapeEnabled);
+        if (typeof parsed.webScrapeAuto === "boolean") setWebScrapeAuto(parsed.webScrapeAuto);
+        if (typeof parsed.githubEnabled === "boolean") setGithubEnabled(parsed.githubEnabled);
+
+        const githubRepoRaw = parsed.githubRepo;
+        if (
+          isRecord(githubRepoRaw) &&
+          typeof githubRepoRaw.owner === "string" &&
+          typeof githubRepoRaw.repo === "string"
+        ) {
+          setGithubRepo({
+            owner: githubRepoRaw.owner,
+            repo: githubRepoRaw.repo,
+            ref: typeof githubRepoRaw.ref === "string" ? githubRepoRaw.ref : "",
+          });
+        } else {
+          setGithubRepo(null);
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    function hydrateFromStorage() {
+      syncSettingsFromStorage();
+
+      try {
+        const rawMessages = safeLocalStorageGet(MESSAGES_KEY);
+        if (rawMessages) {
+          const parsed = JSON.parse(rawMessages) as unknown;
+          if (Array.isArray(parsed)) {
+            const loaded: ChatMessage[] = [];
+            for (const item of parsed) {
+              if (!isRecord(item)) continue;
+              const role = item.role;
+              const content = item.content;
+              if ((role !== "user" && role !== "assistant") || typeof content !== "string") continue;
+              loaded.push({ id: uid(), role, content });
             }
-            loaded.push({ id: uid(), role, content });
+            if (loaded.length) setMessages(loaded);
           }
-          if (loaded.length) setMessages(loaded);
         }
+      } catch {
+        // ignore
       }
-    } catch {
-      // ignore
-    }
-  }, []);
 
-  useEffect(() => {
-    const parsedProjects = readJson(PROJECTS_KEY);
-    if (Array.isArray(parsedProjects)) {
-      const loaded: Project[] = [];
-      for (const item of parsedProjects) {
-        if (!isRecord(item)) continue;
-        if (typeof item.id !== "string" || typeof item.name !== "string") continue;
-        loaded.push({ id: item.id, name: item.name });
-      }
-      const hasInbox = loaded.some((p) => p.id === "inbox");
-      setProjects(hasInbox ? loaded : [{ id: "inbox", name: "Inbox" }, ...loaded]);
-    }
-
-    const parsedTasks = readJson(TASKS_KEY);
-    if (isRecord(parsedTasks)) {
-      const loaded: Record<string, Task[]> = {};
-      for (const [projectId, value] of Object.entries(parsedTasks)) {
-        if (!Array.isArray(value)) continue;
-        const tasks: Task[] = [];
-        for (const item of value) {
+      const parsedProjects = readJson(PROJECTS_KEY);
+      if (Array.isArray(parsedProjects)) {
+        const loaded: Project[] = [];
+        for (const item of parsedProjects) {
           if (!isRecord(item)) continue;
-          if (typeof item.id !== "string" || typeof item.title !== "string") continue;
-          tasks.push({
-            id: item.id,
-            title: item.title,
-            completed: typeof item.completed === "boolean" ? item.completed : false,
-          });
+          if (typeof item.id !== "string" || typeof item.name !== "string") continue;
+          loaded.push({ id: item.id, name: item.name });
         }
-        loaded[projectId] = tasks;
+        const hasInbox = loaded.some((p) => p.id === "inbox");
+        setProjects(hasInbox ? loaded : [{ id: "inbox", name: "Inbox" }, ...loaded]);
       }
-      if (!loaded.inbox) loaded.inbox = [];
-      setTasksByProject(loaded);
-    }
 
-    const parsedPins = readJson(WEB_PINS_KEY);
-    if (isRecord(parsedPins)) {
-      const loaded: Record<string, WebPin[]> = {};
-      for (const [projectId, value] of Object.entries(parsedPins)) {
-        if (!Array.isArray(value)) continue;
-        const pins: WebPin[] = [];
-        for (const item of value) {
-          if (!isRecord(item)) continue;
-          if (typeof item.id !== "string") continue;
-          if (typeof item.title !== "string") continue;
-          if (typeof item.url !== "string") continue;
-          const normalized = normalizePinUrl(item.url);
-          if (!normalized) continue;
-          pins.push({
-            id: item.id,
-            title: item.title,
-            url: normalized,
-            createdAt: typeof item.createdAt === "number" ? item.createdAt : Date.now(),
-          });
+      const parsedTasks = readJson(TASKS_KEY);
+      if (isRecord(parsedTasks)) {
+        const loaded: Record<string, Task[]> = {};
+        for (const [projectId, value] of Object.entries(parsedTasks)) {
+          if (!Array.isArray(value)) continue;
+          const tasks: Task[] = [];
+          for (const item of value) {
+            if (!isRecord(item)) continue;
+            if (typeof item.id !== "string" || typeof item.title !== "string") continue;
+            tasks.push({
+              id: item.id,
+              title: item.title,
+              completed: typeof item.completed === "boolean" ? item.completed : false,
+            });
+          }
+          loaded[projectId] = tasks;
         }
-        loaded[projectId] = pins;
+        if (!loaded.inbox) loaded.inbox = [];
+        setTasksByProject(loaded);
       }
-      if (!loaded.inbox) loaded.inbox = [];
-      setPinsByProject(loaded);
+
+      const parsedPins = readJson(WEB_PINS_KEY);
+      if (isRecord(parsedPins)) {
+        const loaded: Record<string, WebPin[]> = {};
+        for (const [projectId, value] of Object.entries(parsedPins)) {
+          if (!Array.isArray(value)) continue;
+          const pins: WebPin[] = [];
+          for (const item of value) {
+            if (!isRecord(item)) continue;
+            if (typeof item.id !== "string") continue;
+            if (typeof item.title !== "string") continue;
+            if (typeof item.url !== "string") continue;
+            const normalized = normalizePinUrl(item.url);
+            if (!normalized) continue;
+            pins.push({
+              id: item.id,
+              title: item.title,
+              url: normalized,
+              createdAt: typeof item.createdAt === "number" ? item.createdAt : Date.now(),
+            });
+          }
+          loaded[projectId] = pins;
+        }
+        if (!loaded.inbox) loaded.inbox = [];
+        setPinsByProject(loaded);
+      }
+
+      const parsedActive = safeLocalStorageGet(ACTIVE_PROJECT_KEY);
+      if (parsedActive) setActiveProjectId(parsedActive);
+
+      const parsedSidebar = readJson(SIDEBAR_KEY);
+      if (isRecord(parsedSidebar)) {
+        if (typeof parsedSidebar.collapsed === "boolean") setSidebarCollapsed(parsedSidebar.collapsed);
+        if (typeof parsedSidebar.modelOpen === "boolean") setModelOpen(parsedSidebar.modelOpen);
+        if (typeof parsedSidebar.projectsOpen === "boolean") setProjectsOpen(parsedSidebar.projectsOpen);
+        if (typeof parsedSidebar.tasksOpen === "boolean") setTasksOpen(parsedSidebar.tasksOpen);
+        if (typeof parsedSidebar.pinsOpen === "boolean") setPinsOpen(parsedSidebar.pinsOpen);
+        if (typeof parsedSidebar.width === "number") setSidebarWidth(clampInt(parsedSidebar.width, 260, 520));
+      }
     }
 
-    const parsedActive = safeLocalStorageGet(ACTIVE_PROJECT_KEY);
-    if (parsedActive) setActiveProjectId(parsedActive);
+    hydrateFromStorage();
+    setHydrated(true);
 
-    const parsedSidebar = readJson(SIDEBAR_KEY);
-    if (isRecord(parsedSidebar)) {
-      if (typeof parsedSidebar.collapsed === "boolean") setSidebarCollapsed(parsedSidebar.collapsed);
-      if (typeof parsedSidebar.modelOpen === "boolean") setModelOpen(parsedSidebar.modelOpen);
-      if (typeof parsedSidebar.projectsOpen === "boolean") setProjectsOpen(parsedSidebar.projectsOpen);
-      if (typeof parsedSidebar.tasksOpen === "boolean") setTasksOpen(parsedSidebar.tasksOpen);
-      if (typeof parsedSidebar.pinsOpen === "boolean") setPinsOpen(parsedSidebar.pinsOpen);
-      if (typeof parsedSidebar.width === "number") {
-        setSidebarWidth(clampInt(parsedSidebar.width, 260, 520));
-      }
+    function onFocus() {
+      syncSettingsFromStorage();
     }
+
+    function onVisibilityChange() {
+      if (document.visibilityState === "visible") syncSettingsFromStorage();
+    }
+
+    function onStorage(e: StorageEvent) {
+      if (e.key === SETTINGS_KEY) syncSettingsFromStorage();
+    }
+
+    window.addEventListener("focus", onFocus);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("storage", onStorage);
+
+    return () => {
+      window.removeEventListener("focus", onFocus);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("storage", onStorage);
+    };
   }, []);
 
   useEffect(() => {
     try {
+      if (!hydrated) return;
       localStorage.setItem(
         SETTINGS_KEY,
         JSON.stringify(
-          { model, temperature, systemPrompt, webScrapeEnabled, webScrapeAuto } satisfies Settings,
+          {
+            model,
+            temperature,
+            systemPrompt,
+            webScrapeEnabled,
+            webScrapeAuto,
+            githubEnabled,
+            githubRepo,
+          } satisfies Settings,
         ),
       );
     } catch {
       // ignore
     }
-  }, [model, systemPrompt, temperature, webScrapeAuto, webScrapeEnabled]);
+  }, [githubEnabled, githubRepo, hydrated, model, systemPrompt, temperature, webScrapeAuto, webScrapeEnabled]);
 
   useEffect(() => {
     try {
+      if (!hydrated) return;
       localStorage.setItem(
         MESSAGES_KEY,
         JSON.stringify(messages.map((m) => ({ role: m.role, content: m.content }))),
@@ -421,25 +499,30 @@ export default function ChatApp() {
     } catch {
       // ignore
     }
-  }, [messages]);
+  }, [hydrated, messages]);
 
   useEffect(() => {
+    if (!hydrated) return;
     safeLocalStorageSet(PROJECTS_KEY, JSON.stringify(projects));
-  }, [projects]);
+  }, [hydrated, projects]);
 
   useEffect(() => {
+    if (!hydrated) return;
     safeLocalStorageSet(TASKS_KEY, JSON.stringify(tasksByProject));
-  }, [tasksByProject]);
+  }, [hydrated, tasksByProject]);
 
   useEffect(() => {
+    if (!hydrated) return;
     safeLocalStorageSet(WEB_PINS_KEY, JSON.stringify(pinsByProject));
-  }, [pinsByProject]);
+  }, [hydrated, pinsByProject]);
 
   useEffect(() => {
+    if (!hydrated) return;
     safeLocalStorageSet(ACTIVE_PROJECT_KEY, activeProjectId);
-  }, [activeProjectId]);
+  }, [activeProjectId, hydrated]);
 
   useEffect(() => {
+    if (!hydrated) return;
     safeLocalStorageSet(
       SIDEBAR_KEY,
       JSON.stringify({
@@ -451,7 +534,7 @@ export default function ChatApp() {
         width: sidebarWidth,
       }),
     );
-  }, [modelOpen, pinsOpen, projectsOpen, sidebarCollapsed, sidebarWidth, tasksOpen]);
+  }, [hydrated, modelOpen, pinsOpen, projectsOpen, sidebarCollapsed, sidebarWidth, tasksOpen]);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -534,6 +617,35 @@ export default function ChatApp() {
     if (!voiceEnabled) window.speechSynthesis?.cancel();
   }, [voiceEnabled]);
 
+  useEffect(() => {
+    return () => {
+      try {
+        voiceWsClosingRef.current = true;
+        voiceWsRef.current?.ws.close();
+      } catch {
+        // ignore
+      }
+      try {
+        voiceWsRef.current?.processor.disconnect();
+        voiceWsRef.current?.source.disconnect();
+        voiceWsRef.current?.silentGain.disconnect();
+      } catch {
+        // ignore
+      }
+      try {
+        void voiceWsRef.current?.audioContext.close();
+      } catch {
+        // ignore
+      }
+      try {
+        voiceWsRef.current?.micStream.getTracks().forEach((t) => t.stop());
+      } catch {
+        // ignore
+      }
+      voiceWsRef.current = null;
+    };
+  }, []);
+
   function parseScrapeRequest(text: string): { url: string; prompt: string; isCommand: boolean } | null {
     const trimmed = text.trim();
     if (!trimmed) return null;
@@ -613,6 +725,280 @@ export default function ChatApp() {
       // ignore
     }
     setIsListening(true);
+  }
+
+  function getVoiceProxyUrl() {
+    if (typeof window === "undefined") return "";
+    const proto = window.location.protocol === "https:" ? "wss" : "ws";
+    const host = window.location.hostname;
+    return `${proto}://${host}:8787/voice`;
+  }
+
+  function toBase64(bytes: Uint8Array) {
+    let binary = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    return btoa(binary);
+  }
+
+  function fromBase64(base64: string) {
+    const bin = atob(base64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+    return bytes;
+  }
+
+  function downsampleToRate(input: Float32Array, inputRate: number, outputRate: number) {
+    if (outputRate === inputRate) return input;
+    const ratio = inputRate / outputRate;
+    const outLength = Math.floor(input.length / ratio);
+    const out = new Float32Array(outLength);
+    for (let i = 0; i < outLength; i += 1) {
+      const srcIndex = i * ratio;
+      const srcLow = Math.floor(srcIndex);
+      const srcHigh = Math.min(input.length - 1, srcLow + 1);
+      const t = srcIndex - srcLow;
+      out[i] = input[srcLow] * (1 - t) + input[srcHigh] * t;
+    }
+    return out;
+  }
+
+  function floatToPcm16(input: Float32Array) {
+    const out = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i += 1) {
+      const s = Math.max(-1, Math.min(1, input[i] ?? 0));
+      out[i] = s < 0 ? Math.round(s * 32768) : Math.round(s * 32767);
+    }
+    return out;
+  }
+
+  function playPcm16(audioContext: AudioContext, pcm16: Int16Array, sampleRate: number, state: VoiceWsSession) {
+    const float = new Float32Array(pcm16.length);
+    for (let i = 0; i < pcm16.length; i += 1) float[i] = pcm16[i] / 32768;
+    const buffer = audioContext.createBuffer(1, float.length, sampleRate);
+    buffer.getChannelData(0).set(float);
+    const src = audioContext.createBufferSource();
+    src.buffer = buffer;
+    src.connect(audioContext.destination);
+    const startAt = Math.max(audioContext.currentTime, state.nextPlayTime);
+    src.start(startAt);
+    state.nextPlayTime = startAt + buffer.duration;
+  }
+
+  function cleanupVoiceWs() {
+    const session = voiceWsRef.current;
+    voiceWsRef.current = null;
+    try {
+      session?.ws.close();
+    } catch {
+      // ignore
+    }
+    try {
+      session?.processor.disconnect();
+      session?.source.disconnect();
+      session?.silentGain.disconnect();
+    } catch {
+      // ignore
+    }
+    try {
+      void session?.audioContext.close();
+    } catch {
+      // ignore
+    }
+    try {
+      session?.micStream.getTracks().forEach((t) => t.stop());
+    } catch {
+      // ignore
+    }
+  }
+
+  function setVoiceSessionPhase(next: "idle" | "connecting" | "recording" | "responding" | "error") {
+    voiceSessionPhaseRef.current = next;
+    setVoiceSessionStatus(next);
+  }
+
+  async function startVoiceWsSession() {
+    if (typeof window === "undefined") return;
+    if (isVoiceSessionActive) return;
+
+    setVoiceSessionError(null);
+    setVoiceSessionPhase("connecting");
+    setIsVoiceSessionActive(true);
+
+    try {
+      // Avoid overlapping voice systems
+      try {
+        recognitionRef.current?.abort();
+      } catch {
+        // ignore
+      }
+      setIsListening(false);
+      window.speechSynthesis?.cancel();
+
+      const ws = new WebSocket(getVoiceProxyUrl());
+      ws.binaryType = "arraybuffer";
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const audioContext = new AudioContext();
+      const source = audioContext.createMediaStreamSource(stream);
+      const processor = audioContext.createScriptProcessor(4096, 1, 1);
+      const silentGain = audioContext.createGain();
+      silentGain.gain.value = 0;
+      source.connect(processor);
+      processor.connect(silentGain);
+      silentGain.connect(audioContext.destination);
+
+      const session: VoiceWsSession = {
+        ws,
+        micStream: stream,
+        audioContext,
+        source,
+        processor,
+        silentGain,
+        nextPlayTime: audioContext.currentTime,
+      };
+      voiceWsRef.current = session;
+      voiceWsClosingRef.current = false;
+
+      const OUTPUT_RATE = 24000;
+
+      ws.onopen = () => {
+        setVoiceSessionPhase("recording");
+
+        // Attempt OpenAI-style realtime session config (xAI may be compatible).
+        const sessionUpdate = {
+          type: "session.update",
+          session: {
+            instructions: systemPrompt || undefined,
+            input_audio_format: "pcm16",
+            output_audio_format: "pcm16",
+            turn_detection: { type: "server_vad" },
+          },
+        };
+        try {
+          ws.send(JSON.stringify(sessionUpdate));
+        } catch {
+          // ignore
+        }
+      };
+
+      ws.onmessage = (event) => {
+        if (voiceWsClosingRef.current) return;
+        if (typeof event.data !== "string") return;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(event.data) as unknown;
+        } catch {
+          return;
+        }
+        if (!isRecord(parsed)) return;
+        const type = parsed.type;
+        if (type === "error") {
+          const err = typeof parsed.error === "string" ? parsed.error : "Voice session error.";
+          setVoiceSessionError(err);
+          setVoiceSessionPhase("error");
+          return;
+        }
+
+        if (type === "response.audio.delta" || type === "response.output_audio.delta") {
+          const delta = (parsed.delta ?? (isRecord(parsed.audio) ? parsed.audio.delta : null)) as unknown;
+          if (typeof delta !== "string") return;
+          const bytes = fromBase64(delta);
+          const pcm16 = new Int16Array(bytes.buffer, bytes.byteOffset, Math.floor(bytes.byteLength / 2));
+          playPcm16(audioContext, pcm16, OUTPUT_RATE, session);
+          return;
+        }
+
+        if (type === "response.done" || type === "response.completed") {
+          voiceWsClosingRef.current = true;
+          setVoiceSessionPhase("idle");
+          setIsVoiceSessionActive(false);
+          cleanupVoiceWs();
+        }
+      };
+
+      ws.onerror = () => {
+        setVoiceSessionError("Voice websocket error.");
+        setVoiceSessionPhase("error");
+        setIsVoiceSessionActive(false);
+        voiceWsClosingRef.current = true;
+        cleanupVoiceWs();
+      };
+
+      ws.onclose = () => {
+        if (voiceWsClosingRef.current) return;
+        setIsVoiceSessionActive(false);
+        setVoiceSessionPhase("idle");
+        cleanupVoiceWs();
+      };
+
+      processor.onaudioprocess = (e) => {
+        if (ws.readyState !== WebSocket.OPEN) return;
+        if (voiceSessionPhaseRef.current !== "recording") return;
+        const input = e.inputBuffer.getChannelData(0);
+        const down = downsampleToRate(input, audioContext.sampleRate, OUTPUT_RATE);
+        const pcm16 = floatToPcm16(down);
+        const bytes = new Uint8Array(pcm16.buffer);
+        const audio = toBase64(bytes);
+        const msg = { type: "input_audio_buffer.append", audio };
+        try {
+          ws.send(JSON.stringify(msg));
+        } catch {
+          // ignore
+        }
+      };
+    } catch (e) {
+      setVoiceSessionError(e instanceof Error ? e.message : "Voice session failed.");
+      setVoiceSessionPhase("error");
+      setIsVoiceSessionActive(false);
+      voiceWsClosingRef.current = true;
+      cleanupVoiceWs();
+    }
+  }
+
+  function stopVoiceWsSession() {
+    const session = voiceWsRef.current;
+    if (!session) return;
+
+    setVoiceSessionPhase("responding");
+
+    try {
+      session.processor.disconnect();
+      session.source.disconnect();
+      session.silentGain.disconnect();
+    } catch {
+      // ignore
+    }
+    try {
+      session.micStream.getTracks().forEach((t) => t.stop());
+    } catch {
+      // ignore
+    }
+
+    try {
+      session.ws.send(JSON.stringify({ type: "input_audio_buffer.commit" }));
+      session.ws.send(JSON.stringify({ type: "response.create", response: { modalities: ["audio", "text"] } }));
+    } catch {
+      // ignore
+    }
+
+    window.setTimeout(() => {
+      if (!voiceWsRef.current) return;
+      voiceWsClosingRef.current = true;
+      cleanupVoiceWs();
+      setIsVoiceSessionActive(false);
+      setVoiceSessionPhase("idle");
+    }, 15000);
+  }
+
+  function toggleVoiceWsSession() {
+    if (voiceSessionPhaseRef.current === "recording") {
+      stopVoiceWsSession();
+      return;
+    }
+    startVoiceWsSession().catch(() => {});
   }
 
   function speak(text: string) {
@@ -752,6 +1138,8 @@ export default function ChatApp() {
           messages: outgoingMessages,
           tools: {
             firecrawl: webScrapeEnabled,
+            github: githubEnabled,
+            githubRepo,
           },
         }),
         signal: controller.signal,
@@ -1061,6 +1449,25 @@ export default function ChatApp() {
                         >
                           {isListening ? "■" : "⏺"}
                         </button>
+                        <button
+                          type="button"
+                          onClick={toggleVoiceWsSession}
+                          className="jarvis-composer-icon"
+                          data-active={voiceSessionStatus === "recording" ? "true" : "false"}
+                          aria-pressed={voiceSessionStatus === "recording"}
+                          aria-label={
+                            voiceSessionStatus === "recording"
+                              ? "Stop voice and get response"
+                              : "Start voice session"
+                          }
+                          title={
+                            voiceSessionStatus === "recording"
+                              ? "Stop (respond)"
+                              : "Voice-to-voice (WebSocket)"
+                          }
+                        >
+                          🗣
+                        </button>
                       </div>
                       <div className="jarvis-composer-right">
                         <Link
@@ -1089,6 +1496,9 @@ export default function ChatApp() {
                       </div>
                     </div>
                     {voiceError ? <div className="jarvis-error mt-3 text-sm">{voiceError}</div> : null}
+                    {voiceSessionError ? (
+                      <div className="jarvis-error mt-3 text-sm">{voiceSessionError}</div>
+                    ) : null}
                     {error ? <div className="jarvis-error mt-3 text-sm">{error}</div> : null}
                   </div>
                 </div>
@@ -1148,6 +1558,25 @@ export default function ChatApp() {
                       >
                         {isListening ? "■" : "⏺"}
                       </button>
+                      <button
+                        type="button"
+                        onClick={toggleVoiceWsSession}
+                        className="jarvis-composer-icon"
+                        data-active={voiceSessionStatus === "recording" ? "true" : "false"}
+                        aria-pressed={voiceSessionStatus === "recording"}
+                        aria-label={
+                          voiceSessionStatus === "recording"
+                            ? "Stop voice and get response"
+                            : "Start voice session"
+                        }
+                        title={
+                          voiceSessionStatus === "recording"
+                            ? "Stop (respond)"
+                            : "Voice-to-voice (WebSocket)"
+                        }
+                      >
+                        🗣
+                      </button>
                     </div>
                     <div className="jarvis-composer-right">
                       <div className="jarvis-composer-meta" title={model}>
@@ -1180,6 +1609,9 @@ export default function ChatApp() {
                   </div>
                 </div>
                 {voiceError ? <div className="jarvis-error mt-3 text-sm">{voiceError}</div> : null}
+                {voiceSessionError ? (
+                  <div className="jarvis-error mt-3 text-sm">{voiceSessionError}</div>
+                ) : null}
               </div>
             </footer>
           ) : null}

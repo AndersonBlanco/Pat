@@ -15,6 +15,25 @@ Optional (web scrape mode):
 - Enable it in the app at `http://localhost:3000/settings` (Pat will auto-attach page content for URLs and Grok can request a scrape as a tool)
 - Command: `/scrape https://example.com your question`
 
+## GitHub Connect (Repo tools)
+
+To let Grok read/search a GitHub repo:
+
+1) Create a GitHub OAuth App and set its callback URL to `http://localhost:3000/api/auth/github/callback`
+2) Set in `pat/.env.local`:
+   - `PAT_SESSION_SECRET` (any long random string)
+   - `GITHUB_CLIENT_ID`
+   - `GITHUB_CLIENT_SECRET`
+3) In the app, go to `http://localhost:3000/settings` → Connect GitHub → pick a repo → enable GitHub tools
+
+Once enabled, Grok can browse and read your repo via tools:
+- Ask: “List my repos” (uses `github_repos`)
+- Ask: “List the repo root” (uses `github_list`)
+- Ask: “Open `path/to/file.ts`” (uses `github_read`)
+- Ask: “Find where `fooBar` is defined” (uses `github_search`)
+
+Note: GitHub code search may not match non-default branches; `github_read`/`github_list` use your selected branch/ref.
+
 ## xAI Models (Notes)
 
 Quick reference notes I can keep in-repo for later planning: `pat/docs/xai-models.md`.
