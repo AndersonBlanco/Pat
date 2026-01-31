@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import Link from "next/link";
 import GalaxyBackground from "./GalaxyBackground";
 
@@ -33,6 +33,14 @@ type Task = {
   id: string;
   title: string;
   completed: boolean;
+};
+
+type TodoistSidebarTask = {
+  id: string;
+  title: string;
+  completed: boolean;
+  url: string;
+  due: { date?: string; datetime?: string; string?: string; timezone?: string | null } | null;
 };
 
 type WebPin = {
@@ -91,6 +99,7 @@ const ACTIVE_PROJECT_KEY = "pat.activeProjectId.v1";
 const SIDEBAR_KEY = "pat.sidebar.v1";
 const DAG_KEY = "pat.dag.v1";
 const DAG_ASK_PAT_KEY = "pat.dag.askPat.v1";
+const TODOIST_TASK_LABEL = "Task";
 
 const DEFAULT_SETTINGS: Settings = {
   model: "grok-3",
@@ -243,6 +252,8 @@ export default function ChatApp() {
   const [githubEnabled, setGithubEnabled] = useState(DEFAULT_SETTINGS.githubEnabled);
   const [githubRepo, setGithubRepo] = useState<Settings["githubRepo"]>(DEFAULT_SETTINGS.githubRepo);
 
+  const todoistEnabled = Boolean(todoistToken.trim());
+
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: uid(),
@@ -284,6 +295,10 @@ export default function ChatApp() {
     inbox: [],
   });
 
+  const [todoistTasks, setTodoistTasks] = useState<TodoistSidebarTask[]>([]);
+  const [todoistTasksLoading, setTodoistTasksLoading] = useState(false);
+  const [todoistTasksError, setTodoistTasksError] = useState<string | null>(null);
+
   const [newProjectName, setNewProjectName] = useState("");
   const [newTaskTitle, setNewTaskTitle] = useState("");
   const [newPinUrl, setNewPinUrl] = useState("");
@@ -304,9 +319,13 @@ export default function ChatApp() {
       projects.find((p) => p.id === activeProjectId) ?? { id: activeProjectId, name: "Inbox" };
 
     const projectsPayload = projects.slice(0, 30).map((p) => ({ id: p.id, name: p.name }));
-    const tasks = (tasksByProject[activeProjectId] ?? [])
-      .slice(0, 60)
-      .map((t) => ({ id: t.id, title: t.title, completed: t.completed }));
+    const displayedTasks = todoistEnabled ? todoistTasks : tasksByProject[activeProjectId] ?? [];
+    const tasks = displayedTasks.slice(0, 60).map((t) => ({
+      id: t.id,
+      title: t.title,
+      completed: t.completed,
+      source: todoistEnabled ? "todoist" : "local",
+    }));
     const webPins = (pinsByProject[activeProjectId] ?? [])
       .slice(0, 60)
       .map((p) => ({ id: p.id, title: p.title, url: p.url }));
@@ -339,17 +358,72 @@ export default function ChatApp() {
         selectedRepo: githubRepo ? `${githubRepo.owner}/${githubRepo.repo}` : null,
         ref: githubRepo?.ref || "",
       },
+      todoist: {
+        connected: todoistEnabled,
+        labelFilter: todoistEnabled ? TODOIST_TASK_LABEL : "",
+      },
       meta: {
         truncated: {
           projects: projects.length > projectsPayload.length,
-          tasks: (tasksByProject[activeProjectId] ?? []).length > tasks.length,
+          tasks: displayedTasks.length > tasks.length,
           webPins: (pinsByProject[activeProjectId] ?? []).length > webPins.length,
         },
       },
     };
 
     return `Workspace context (Projects/Tasks/Web Pins): ${JSON.stringify(payload)}`;
-  }, [activeProjectId, dag, githubEnabled, githubRepo, pinsByProject, projects, tasksByProject]);
+  }, [activeProjectId, dag, githubEnabled, githubRepo, pinsByProject, projects, tasksByProject, todoistEnabled, todoistTasks]);
+
+  const refreshTodoistTasks = useCallback(async (signal?: AbortSignal) => {
+    if (!todoistEnabled) {
+      setTodoistTasks([]);
+      setTodoistTasksError(null);
+      setTodoistTasksLoading(false);
+      return;
+    }
+
+    setTodoistTasksLoading(true);
+    try {
+      const res = await fetch(`/api/todoist/tasks?label=${encodeURIComponent(TODOIST_TASK_LABEL)}&limit=120`, {
+        headers: { authorization: `Bearer ${todoistToken}` },
+        signal,
+      });
+
+      const data = (await res.json().catch(() => null)) as
+        | { ok: true; tasks: TodoistSidebarTask[]; total: number }
+        | { ok: false; error: string }
+        | null;
+
+      if (!res.ok || !data || data.ok === false) {
+        const message = (data && "error" in data && data.error) || `Todoist request failed (${res.status})`;
+        throw new Error(message);
+      }
+
+      setTodoistTasksError(null);
+      setTodoistTasks(data.tasks);
+    } catch (e) {
+      if (e instanceof DOMException && e.name === "AbortError") return;
+      setTodoistTasksError(e instanceof Error ? e.message : "Todoist request failed.");
+    } finally {
+      setTodoistTasksLoading(false);
+    }
+  }, [todoistEnabled, todoistToken]);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void refreshTodoistTasks(controller.signal);
+    return () => {
+      controller.abort();
+    };
+  }, [refreshTodoistTasks]);
+
+  useEffect(() => {
+    if (!todoistEnabled) return;
+    const id = window.setInterval(() => {
+      void refreshTodoistTasks();
+    }, 60_000);
+    return () => window.clearInterval(id);
+  }, [todoistEnabled, refreshTodoistTasks]);
 
   useEffect(() => {
     function syncSettingsFromStorage() {
@@ -1270,6 +1344,7 @@ export default function ChatApp() {
         prev.map((m) => (m.id === placeholder.id ? { ...m, content: data.message.content } : m)),
       );
       speak(data.message.content);
+      if (todoistEnabled) void refreshTodoistTasks();
     } catch (e) {
       setMessages((prev) => prev.filter((m) => m.id !== placeholder.id));
       setError(e instanceof Error ? e.message : "Request failed");
@@ -1312,6 +1387,41 @@ export default function ChatApp() {
   function addTask() {
     const title = newTaskTitle.trim();
     if (!title) return;
+    if (todoistEnabled) {
+      const original = newTaskTitle;
+      setNewTaskTitle("");
+      void (async () => {
+        try {
+          const res = await fetch("/api/todoist/tasks", {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${todoistToken}`,
+              "content-type": "application/json",
+            },
+            body: JSON.stringify({ content: title, labels: [TODOIST_TASK_LABEL] }),
+          });
+
+          const data = (await res.json().catch(() => null)) as
+            | { ok: true; task: TodoistSidebarTask }
+            | { ok: false; error: string }
+            | null;
+
+          if (!res.ok || !data || data.ok === false) {
+            const message = (data && "error" in data && data.error) || `Todoist request failed (${res.status})`;
+            throw new Error(message);
+          }
+
+          setTodoistTasks((prev) => [data.task, ...prev]);
+          setTodoistTasksError(null);
+        } catch (e) {
+          setNewTaskTitle(original);
+          setError(e instanceof Error ? e.message : "Todoist request failed.");
+        } finally {
+          void refreshTodoistTasks();
+        }
+      })();
+      return;
+    }
     const task: Task = { id: uid(), title, completed: false };
     setTasksByProject((prev) => {
       const list = prev[activeProjectId] ?? [];
@@ -1321,6 +1431,31 @@ export default function ChatApp() {
   }
 
   function toggleTaskCompleted(taskId: string) {
+    if (todoistEnabled) {
+      void (async () => {
+        try {
+          const res = await fetch(`/api/todoist/tasks/${encodeURIComponent(taskId)}/close`, {
+            method: "POST",
+            headers: { authorization: `Bearer ${todoistToken}` },
+          });
+          const data = (await res.json().catch(() => null)) as
+            | { ok: true }
+            | { ok: false; error: string }
+            | null;
+          if (!res.ok || !data || data.ok === false) {
+            const message = (data && "error" in data && data.error) || `Todoist request failed (${res.status})`;
+            throw new Error(message);
+          }
+          setTodoistTasks((prev) => prev.filter((t) => t.id !== taskId));
+          setTodoistTasksError(null);
+        } catch (e) {
+          setError(e instanceof Error ? e.message : "Todoist request failed.");
+        } finally {
+          void refreshTodoistTasks();
+        }
+      })();
+      return;
+    }
     setTasksByProject((prev) => {
       const list = prev[activeProjectId] ?? [];
       return {
@@ -1331,6 +1466,31 @@ export default function ChatApp() {
   }
 
   function removeTask(taskId: string) {
+    if (todoistEnabled) {
+      void (async () => {
+        try {
+          const res = await fetch(`/api/todoist/tasks/${encodeURIComponent(taskId)}`, {
+            method: "DELETE",
+            headers: { authorization: `Bearer ${todoistToken}` },
+          });
+          const data = (await res.json().catch(() => null)) as
+            | { ok: true }
+            | { ok: false; error: string }
+            | null;
+          if (!res.ok || !data || data.ok === false) {
+            const message = (data && "error" in data && data.error) || `Todoist request failed (${res.status})`;
+            throw new Error(message);
+          }
+          setTodoistTasks((prev) => prev.filter((t) => t.id !== taskId));
+          setTodoistTasksError(null);
+        } catch (e) {
+          setError(e instanceof Error ? e.message : "Todoist request failed.");
+        } finally {
+          void refreshTodoistTasks();
+        }
+      })();
+      return;
+    }
     setTasksByProject((prev) => {
       const list = prev[activeProjectId] ?? [];
       return { ...prev, [activeProjectId]: list.filter((t) => t.id !== taskId) };
@@ -1387,6 +1547,7 @@ export default function ChatApp() {
   }
 
   function moveTaskWithinActive(dragId: string, overId: string) {
+    if (todoistEnabled) return;
     if (dragId === overId) return;
     setTasksByProject((prev) => {
       const list = prev[activeProjectId] ?? [];
@@ -1444,7 +1605,7 @@ export default function ChatApp() {
     "grok-2-vision-1212",
   ];
 
-  const activeTasks = tasksByProject[activeProjectId] ?? [];
+  const activeTasks = todoistEnabled ? todoistTasks : tasksByProject[activeProjectId] ?? [];
   const activePins = pinsByProject[activeProjectId] ?? [];
   const activeProjectName = projects.find((p) => p.id === activeProjectId)?.name ?? "Inbox";
   const hasUserMessage = messages.some((m) => m.role === "user");
@@ -1956,12 +2117,33 @@ export default function ChatApp() {
 
                     <div className="jarvis-collapsible" data-open={tasksOpen ? "true" : "false"}>
                       <div className="space-y-3 pt-1">
-                        <div className="jarvis-active-project" title={`Active project: ${activeProjectName}`}>
-                          <span className="jarvis-active-project-label">Active</span>
-                          <span className="jarvis-active-project-name">{activeProjectName}</span>
+                        <div
+                          className="jarvis-active-project"
+                          title={
+                            todoistEnabled
+                              ? `Todoist tasks (label: ${TODOIST_TASK_LABEL})`
+                              : `Active project: ${activeProjectName}`
+                          }
+                        >
+                          <span className="jarvis-active-project-label">
+                            {todoistEnabled ? "Todoist" : "Active"}
+                          </span>
+                          <span className="jarvis-active-project-name">
+                            {todoistEnabled ? `Label: ${TODOIST_TASK_LABEL}` : activeProjectName}
+                          </span>
                         </div>
 
                         <div className="space-y-2">
+                          {todoistEnabled && todoistTasksLoading ? (
+                            <div className="text-[12px] text-[color:var(--jarvis-muted)]">
+                              Syncing Todoist…
+                            </div>
+                          ) : null}
+
+                          {todoistEnabled && todoistTasksError ? (
+                            <div className="jarvis-error text-sm">{todoistTasksError}</div>
+                          ) : null}
+
                           {activeTasks.length ? (
                             activeTasks.map((t) => (
                               <div
@@ -1971,8 +2153,9 @@ export default function ChatApp() {
                                     ? "jarvis-task-item jarvis-task-item-dragging"
                                     : "jarvis-task-item"
                                 }
-                                draggable
+                                draggable={!todoistEnabled}
                                 onDragStart={(e) => {
+                                  if (todoistEnabled) return;
                                   setDragTaskId(t.id);
                                   e.dataTransfer.effectAllowed = "move";
                                   e.dataTransfer.setData("text/plain", t.id);
@@ -1994,11 +2177,13 @@ export default function ChatApp() {
                                   className="jarvis-task-check"
                                   onClick={() => toggleTaskCompleted(t.id)}
                                   aria-label={
-                                    t.completed
-                                      ? "Mark task as not completed"
-                                      : "Mark task as completed"
+                                    todoistEnabled
+                                      ? "Complete Todoist task"
+                                      : t.completed
+                                          ? "Mark task as not completed"
+                                          : "Mark task as completed"
                                   }
-                                  title={t.completed ? "Uncomplete" : "Complete"}
+                                  title={todoistEnabled ? "Complete in Todoist" : t.completed ? "Uncomplete" : "Complete"}
                                 >
                                   {t.completed ? "✓" : "○"}
                                 </button>
@@ -2017,8 +2202,8 @@ export default function ChatApp() {
                                   type="button"
                                   className="jarvis-icon-button jarvis-task-remove"
                                   onClick={() => removeTask(t.id)}
-                                  aria-label="Remove task"
-                                  title="Remove"
+                                  aria-label={todoistEnabled ? "Delete Todoist task" : "Remove task"}
+                                  title={todoistEnabled ? "Delete" : "Remove"}
                                 >
                                   ×
                                 </button>
@@ -2026,7 +2211,11 @@ export default function ChatApp() {
                             ))
                           ) : (
                             <div className="text-[12px] text-[color:var(--jarvis-muted)]">
-                              No tasks yet.
+                              {todoistEnabled
+                                ? todoistTasksLoading || todoistTasksError
+                                    ? ""
+                                    : `No Todoist tasks labeled “${TODOIST_TASK_LABEL}”.`
+                                : "No tasks yet."}
                             </div>
                           )}
                         </div>
@@ -2120,7 +2309,7 @@ export default function ChatApp() {
                         onKeyDown={(e) => {
                           if (e.key === "Enter") addTask();
                         }}
-                        placeholder={`New task in ${activeProjectName}…`}
+                        placeholder={todoistEnabled ? "New Todoist task…" : `New task in ${activeProjectName}…`}
                         className="jarvis-input h-10 min-w-0 flex-1 px-3 text-[13px]"
                       />
                       <button type="button" onClick={addTask} className="jarvis-button px-3">
